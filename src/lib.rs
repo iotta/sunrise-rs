@@ -3,6 +3,7 @@ mod constants;
 
 use constants::{
     ErrorStatusMask::{self, *},
+    MeasurementMode,
     Registers::{self, *},
 };
 use defmt::Format;
@@ -22,6 +23,8 @@ pub enum SunriseError {
     I2CWriteError(u8),
     IllegalRegister,
     ReadyReadFail,
+    NotSupported,
+    NeedReset,
 }
 
 pub type SrRes<T> = Result<T, SunriseError>;
@@ -66,6 +69,8 @@ pub struct SunriseI2C<EN, RDY, TWI, D> {
     i2c: TWI,
     dev_addr: u8,
     delay: D,
+    state_is_dirty: bool,
+    state: [u8; 24],
 }
 
 impl<EN, RDY, I2C, D, E> SunriseI2C<EN, RDY, I2C, D>
@@ -73,7 +78,7 @@ where
     EN: OutputPin,
     RDY: InputPin,
     I2C: WriteRead<Error = E> + Write<Error = E> + Read<Error = E>,
-    // E: core::fmt::Debug,
+    E: core::fmt::Debug,
     D: DelayMs<u32>,
 {
     pub fn new(i2c: I2C, en_pin: EN, rdy_pin: RDY, delay: D) -> Self {
@@ -83,12 +88,34 @@ where
             i2c,
             delay,
             dev_addr: DEFAULT_I2C_ADRESS,
+            state: [
+                0, 1, 149, 153, 255, 25, 2, 208, 3, 104, 0, 5, 0, 4, 0, 35, 148, 161, 0, 170, 254,
+                213, 0, 170,
+            ], //[0; 24],
+            state_is_dirty: true,
         }
     }
 
     pub fn get_error_status(&mut self) -> SrRes<ErrorStatus> {
         let raw = self.read_reg16(ErrorstatusMsb)?;
         Ok(ErrorStatus(raw))
+    }
+
+    pub fn single_measurement_mode(&mut self) -> SrRes<()> {
+        self.set_measurement_mode(MeasurementMode::Single)
+    }
+
+    pub fn continuous_measurement_mode(&mut self, period: u16) -> SrRes<()> {
+        self.write_reg16(MeasurementPeriodMsb, period)?;
+        self.set_measurement_mode(MeasurementMode::Continuous)
+    }
+
+    fn set_measurement_mode(&mut self, mode: MeasurementMode) -> SrRes<()> {
+        match mode {
+            MeasurementMode::Continuous => self.write_reg8(MeasurementMode, 0),
+            MeasurementMode::Single => self.write_reg8(MeasurementMode, 1),
+        }?;
+        self.soft_reset().or(Err(SunriseError::NeedReset))
     }
 
     pub fn do_single_measurement(&mut self) -> SrRes<()> {
@@ -122,47 +149,96 @@ where
         self.read_reg32(SensorIdMmsb)
     }
 
-    pub fn disable(&mut self) {
+    pub fn disable(&mut self) -> SrRes<()> {
         if let Some(en) = self.en_pin.as_mut() {
             defmt::trace!("Disable sensor");
             let _ = en.set_low();
+            self.state_is_dirty = true;
+            Ok(())
+        } else {
+            Err(SunriseError::NotSupported)
         }
     }
 
-    pub fn enable(&mut self) {
+    pub fn enable(&mut self) -> SrRes<()> {
         if let Some(en) = self.en_pin.as_mut() {
             defmt::trace!("Enable sensor");
             let _ = en.set_high();
             self.delay.delay_ms(35);
+            Ok(())
+        } else {
+            Err(SunriseError::NotSupported)
         }
+    }
+
+    pub fn soft_reset(&mut self) -> SrRes<()> {
+        // self.state_is_dirty = true;
+        // self.write_reg8(SCR, 0xff)?; // Hmm.. this does not seem to work too well.
+        self.disable()?;
+        self.delay.delay_ms(10);
+        self.enable()
+    }
+
+    pub fn save_state(&mut self) -> SrRes<()> {
+        let mut state = [0u8; 24];
+        // the filter params trail the AbcTimeMsbMirror register 0xc4
+        self.read_reg(AbcTimeMsbMirror, &mut state[..])?;
+        self.state = state;
+        defmt::info!("save state: {}", self.state);
+
+        Ok(())
+    }
+
+    pub fn delay_ms(&mut self, delay: u32) {
+        self.delay.delay_ms(delay);
+    }
+
+    pub fn restore_state(&mut self) -> SrRes<()> {
+        defmt::info!("Restore state: {}", self.state);
+
+        let mut state_w_register = [0u8; 25];
+        state_w_register[0] = AbcTimeMsbMirror as u8;
+        state_w_register[1..].clone_from_slice(&self.state);
+
+        defmt::info!("Restore state_w: {}", state_w_register);
+
+        self.i2c
+            .write(self.dev_addr, &mut state_w_register)
+            .or(Err(SunriseError::I2CWriteError(self.dev_addr)))?;
+
+        self.state_is_dirty = false;
+        Ok(())
     }
 
     fn read_reg8(&mut self, reg: Registers) -> SrRes<u8> {
         let mut buf = [0u8];
         self.read_reg(reg, &mut buf)?;
 
-        Ok(buf[0] as u8)
+        Ok(u8::from_be_bytes(buf))
     }
 
     fn read_reg16(&mut self, reg: Registers) -> SrRes<u16> {
         let mut buf = [0u8; 2];
         self.read_reg(reg, &mut buf)?;
 
-        Ok((buf[0] as u16) << 8 | (buf[1] as u16))
+        Ok(u16::from_be_bytes(buf))
     }
 
     fn read_reg32(&mut self, reg: Registers) -> SrRes<u32> {
         let mut buf = [0u8; 4];
         self.read_reg(reg, &mut buf)?;
 
-        Ok((buf[0] as u32) << 24 | (buf[1] as u32) << 16 | (buf[2] as u32) << 8 | (buf[3] as u32))
+        Ok(u32::from_be_bytes(buf))
     }
 
     fn read_reg(&mut self, reg: Registers, buffer: &mut [u8]) -> SrRes<()> {
         self.wake();
         self.i2c
             .write_read(self.dev_addr, &[reg as u8], buffer)
-            .or(Err(SunriseError::I2CReadError(self.dev_addr)))
+            .or(Err(SunriseError::I2CReadError(self.dev_addr)))?;
+
+        defmt::trace!("read_reg {}({:#04x}) -> {:#04x}", reg, reg as u8, buffer);
+        Ok(())
     }
 
     fn write_reg16(&mut self, reg: Registers, data: u16) -> SrRes<()> {
@@ -173,11 +249,16 @@ where
 
     fn write_reg8(&mut self, reg: Registers, data: u8) -> SrRes<()> {
         self.wake();
-
-        let result = self
-            .i2c
+        defmt::trace!(
+            "write_reg {}({:#04x}{}): {:#04x}",
+            reg,
+            reg as u8,
+            if reg.is_ee() { ", EE" } else { "" },
+            data
+        );
+        self.i2c
             .write(self.dev_addr, &[reg as u8, data])
-            .or(Err(SunriseError::I2CWriteError(self.dev_addr)));
+            .or(Err(SunriseError::I2CWriteError(self.dev_addr)))?;
 
         if reg.is_ee() {
             self.delay.delay_ms(25);
@@ -185,7 +266,7 @@ where
             self.delay.delay_ms(1);
         }
 
-        result
+        Ok(())
     }
 
     /// Dummy write for waking up the sensor

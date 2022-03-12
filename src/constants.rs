@@ -6,8 +6,8 @@ use num_enum::TryFromPrimitive;
 use crate::{SrRes, SunriseError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Format)]
-enum MeasurementMode {
-    Cnntinuous,
+pub enum MeasurementMode {
+    Continuous,
     Single,
 }
 

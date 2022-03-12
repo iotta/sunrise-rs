@@ -1,0 +1,16 @@
+[package]
+categories = ["embedded", "hardware-support", "no-std"]
+description = "Rust driver for the Senseair Sunrise CO2 sensor"
+edition = "2018"
+homepage = "https://github.com/iotta/senseair-sunrise-rs"
+keywords = ["co2", "sensor", "embedded-hal-driver", "i2c"]
+license = "MIT OR Apache-2.0"
+name = "senseair-sunrise"
+repository = "https://github.com/iotta/senseair-sunrise-rs"
+version = "0.1.0"
+
+[dependencies]
+defmt = "0.3.0"
+num_enum = {version = "0.5.7", default-features = false}
+# derive_more = {version = "0.99.17", default-features = false, features = ["error", "display"]}
+embedded-hal = {version = "^0.2", features = ["unproven"]}

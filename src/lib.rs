@@ -21,10 +21,19 @@ pub enum SunriseError {
     I2CReadError(u8),
     // #[error("Error while writing to slave '{0:x}' on i2c bus")]
     I2CWriteError(u8),
+    GpioError,
     IllegalRegister,
     ReadyReadFail,
     NotSupported,
     NeedReset,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Format)]
+enum State {
+    Initial,       // no saved state (1st startup, no state on host)
+    NeedsHostData, // Sensor need copy of state (after enabling/reset of sensor, no state on sensor)
+    Valid,         // Sensor has valid data
 }
 
 pub type SrRes<T> = Result<T, SunriseError>;
@@ -69,8 +78,8 @@ pub struct SunriseI2C<EN, RDY, TWI, D> {
     i2c: TWI,
     dev_addr: u8,
     delay: D,
-    state_is_dirty: bool,
-    state: [u8; 24],
+    state: State,
+    state_data: [u8; 24],
 }
 
 impl<EN, RDY, I2C, D, E> SunriseI2C<EN, RDY, I2C, D>
@@ -88,11 +97,8 @@ where
             i2c,
             delay,
             dev_addr: DEFAULT_I2C_ADRESS,
-            state: [
-                0, 1, 149, 153, 255, 25, 2, 208, 3, 104, 0, 5, 0, 4, 0, 35, 148, 161, 0, 170, 254,
-                213, 0, 170,
-            ], //[0; 24],
-            state_is_dirty: true,
+            state_data: [0; 24],
+            state: State::Initial,
         }
     }
 
@@ -101,12 +107,18 @@ where
         Ok(ErrorStatus(raw))
     }
 
-    pub fn single_measurement_mode(&mut self) -> SrRes<()> {
+    pub fn set_single_measurement_mode(&mut self) -> SrRes<()> {
         self.set_measurement_mode(MeasurementMode::Single)
     }
 
-    pub fn continuous_measurement_mode(&mut self, period: u16) -> SrRes<()> {
-        self.write_reg16(MeasurementPeriodMsb, period)?;
+    /// Default period is 16 secs
+    pub fn set_continuous_measurement_mode(&mut self, period_s: u16) -> SrRes<()> {
+        if period_s == 0 {
+            self.write_reg16(MeasurementPeriodMsb, 16)?;
+        } else {
+            self.write_reg16(MeasurementPeriodMsb, period_s)?;
+        }
+
         self.set_measurement_mode(MeasurementMode::Continuous)
     }
 
@@ -119,17 +131,59 @@ where
     }
 
     pub fn do_single_measurement(&mut self) -> SrRes<()> {
-        self.write_reg8(StartSingleMeasurement, 1)?;
-        // self.delay.delay_ms(2400);
+        defmt::debug!("do_single_measurement, state: {}", self.state);
+
+        if self.state == State::NeedsHostData {
+            let mut single_with_state = [0u8; 26];
+            single_with_state[0] = StartSingleMeasurementMirror as u8;
+            single_with_state[1] = 1;
+            single_with_state[2..].clone_from_slice(&self.state_data);
+
+            defmt::debug!("Restore state_w: {}", single_with_state);
+            self.write_raw(&single_with_state)?;
+        } else {
+            self.write_reg8(StartSingleMeasurement, 1)?;
+        }
+
+        self.state = State::Valid;
         self.wait_rdy()
+    }
+
+    pub fn save_state_on_host(&mut self) -> SrRes<()> {
+        let mut state_data = [0u8; 24];
+        let result = self.read_reg(AbcTimeMsbMirror, &mut state_data[..]); // the filter params trail the AbcTimeMsbMirror register 0xc4
+        self.state_data = state_data;
+
+        defmt::debug!("save state({:?}) -> {}", result, self.state_data);
+
+        result
+    }
+
+    pub fn delay_ms(&mut self, delay: u32) {
+        self.delay.delay_ms(delay);
+    }
+
+    pub fn get_measurement_count(&mut self) -> SrRes<u8> {
+        self.read_reg8(MeasurementCount)
     }
 
     pub fn get_co2_filt_pcmp(&mut self) -> SrRes<u16> {
         self.read_reg16(Co2FpMsb)
     }
 
-    pub fn set_abc_target(&mut self, target: u16) -> SrRes<()> {
-        self.write_reg16(AbcTargetMsb, target)
+    /// Default is 8 samples
+    pub fn set_number_of_samples(&mut self, samples: u16) -> SrRes<()> {
+        self.write_reg16(NumberOfSamplesMsb, samples)
+    }
+
+    /// Default is 180 hours
+    pub fn set_abc_period(&mut self, period_h: u16) -> SrRes<()> {
+        self.write_reg16(AbcTargetMsb, period_h)
+    }
+
+    /// Default is 400 ppm
+    pub fn set_abc_target(&mut self, target_ppm: u16) -> SrRes<()> {
+        self.write_reg16(AbcTargetMsb, target_ppm)
     }
 
     pub fn get_abc_target(&mut self) -> SrRes<u16> {
@@ -149,12 +203,22 @@ where
         self.read_reg32(SensorIdMmsb)
     }
 
+    pub fn clear_error_status(&mut self) -> SrRes<()> {
+        self.write_reg8(ClearErrorstatus, 1)
+    }
+
     pub fn disable(&mut self) -> SrRes<()> {
+        if self.en_pin.is_some() {
+            defmt::trace!("Disable sensor (state: {:?})", self.state);
+
+            if self.state != State::Initial {
+                self.state = State::NeedsHostData;
+                self.save_state_on_host()?; // How to handle(?): not being able to save status to host, prevents sensor from sleeping..
+            }
+        }
+
         if let Some(en) = self.en_pin.as_mut() {
-            defmt::trace!("Disable sensor");
-            let _ = en.set_low();
-            self.state_is_dirty = true;
-            Ok(())
+            en.set_low().or(Err(SunriseError::GpioError))
         } else {
             Err(SunriseError::NotSupported)
         }
@@ -172,42 +236,15 @@ where
     }
 
     pub fn soft_reset(&mut self) -> SrRes<()> {
-        // self.state_is_dirty = true;
-        // self.write_reg8(SCR, 0xff)?; // Hmm.. this does not seem to work too well.
+        // if self.state != State::Initial {
+        //     self.state = State::NeedsHostData;
+        //     self.save_state_on_host()?;
+        // }
+        // self.write_reg8(SCR, 0xff) // Hmm.. this does not seem to work all too well (i.e. at all).
+
         self.disable()?;
         self.delay.delay_ms(10);
         self.enable()
-    }
-
-    pub fn save_state(&mut self) -> SrRes<()> {
-        let mut state = [0u8; 24];
-        // the filter params trail the AbcTimeMsbMirror register 0xc4
-        self.read_reg(AbcTimeMsbMirror, &mut state[..])?;
-        self.state = state;
-        defmt::info!("save state: {}", self.state);
-
-        Ok(())
-    }
-
-    pub fn delay_ms(&mut self, delay: u32) {
-        self.delay.delay_ms(delay);
-    }
-
-    pub fn restore_state(&mut self) -> SrRes<()> {
-        defmt::info!("Restore state: {}", self.state);
-
-        let mut state_w_register = [0u8; 25];
-        state_w_register[0] = AbcTimeMsbMirror as u8;
-        state_w_register[1..].clone_from_slice(&self.state);
-
-        defmt::info!("Restore state_w: {}", state_w_register);
-
-        self.i2c
-            .write(self.dev_addr, &mut state_w_register)
-            .or(Err(SunriseError::I2CWriteError(self.dev_addr)))?;
-
-        self.state_is_dirty = false;
-        Ok(())
     }
 
     fn read_reg8(&mut self, reg: Registers) -> SrRes<u8> {
@@ -238,6 +275,10 @@ where
             .or(Err(SunriseError::I2CReadError(self.dev_addr)))?;
 
         defmt::trace!("read_reg {}({:#04x}) -> {:#04x}", reg, reg as u8, buffer);
+        self.delay.delay_ms(1); // Fixes (workaround?) wierd I2C io errors that pop up occasionally
+                                // Adding the delay in wake() (on err/nack) is not helping
+                                // Problem arises when demo is switched from continuous mode to single mode
+                                // when trace logging (line above) is disabled.. (cause is not clear for now)
         Ok(())
     }
 
@@ -248,7 +289,6 @@ where
     }
 
     fn write_reg8(&mut self, reg: Registers, data: u8) -> SrRes<()> {
-        self.wake();
         defmt::trace!(
             "write_reg {}({:#04x}{}): {:#04x}",
             reg,
@@ -256,27 +296,53 @@ where
             if reg.is_ee() { ", EE" } else { "" },
             data
         );
-        self.i2c
-            .write(self.dev_addr, &[reg as u8, data])
-            .or(Err(SunriseError::I2CWriteError(self.dev_addr)))?;
+
+        self.write_raw(&[reg as u8, data])?;
 
         if reg.is_ee() {
             self.delay.delay_ms(25);
         } else {
             self.delay.delay_ms(1);
         }
-
         Ok(())
+    }
+
+    fn write_raw(&mut self, data: &[u8]) -> SrRes<()> {
+        self.wake();
+
+        self.i2c
+            .write(self.dev_addr, data)
+            .or(Err(SunriseError::I2CWriteError(self.dev_addr)))
     }
 
     /// Dummy write for waking up the sensor
     fn wake(&mut self) {
+        let mut dummy = [0u8];
+        // let _ = self.i2c.write(self.dev_addr, &mut dummy);
+        if let Err(_) = self.i2c.read(self.dev_addr, &mut dummy) {
+            // This does not seem to fix the ocasional read error
+            // self.delay.delay_ms(1);
+        }
+    }
+
+    fn _wake(&mut self) -> SrRes<()> {
         let dummy = [0u8];
-        let _ = self.i2c.write(self.dev_addr, &dummy); // It's expected to return an Err(AddressNack)
+        let mut times = 5; // max tries for wakin'
+        while self.i2c.write(self.dev_addr, &dummy).is_err() && times > 0 {
+            times -= 1;
+        }
+
+        if times > 0 {
+            Ok(())
+        } else {
+            defmt::warn!("wake() -> SunriseError::TimedOut");
+            Err(SunriseError::TimedOut)
+        }
     }
 
     fn wait_rdy(&self) -> SrRes<()> {
         defmt::trace!("wait_rdy");
+        // self.delay.delay_ms(no_samples * 300);
         while !self.is_ready()? {}
         Ok(())
     }

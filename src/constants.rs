@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-
 use defmt::Format;
-use num_enum::TryFromPrimitive;
+pub use num_enum::TryFromPrimitive;
 
 use crate::{SrRes, SunriseError};
 

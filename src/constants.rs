@@ -10,7 +10,7 @@ pub enum MeasurementMode {
     Single,
 }
 
-enum CalibrationType {
+pub enum CalibrationCommand {
     FactoryReset = 0x7C02,
     AbcForced = 0x7C03,
     Target = 0x7C05,
@@ -19,12 +19,53 @@ enum CalibrationType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Format)]
+pub struct MeterControlValue(u8);
+
+impl MeterControlValue {
+    pub const NRDY_ENABLED: u8 = (0 << 0);
+    pub const NRDY_DISABLED: u8 = (1 << 0);
+
+    pub const ABC_ENABLED: u8 = (0 << 1);
+    pub const ABC_DISABLED: u8 = (1 << 1);
+
+    pub const STATIC_IIR_ENABLED: u8 = (0 << 2);
+    pub const STATIC_IIR_DISABLED: u8 = (1 << 2);
+
+    pub const DYNAMIC_IIR_ENABLED: u8 = (0 << 3);
+    pub const DYNAMIC_IIR_DISABLED: u8 = (1 << 3);
+
+    pub const PCOMP_ENABLED: u8 = (0 << 4);
+    pub const PCOMP_DISABLED: u8 = (1 << 4);
+
+    pub const NRDY_INVERT_ENABLED: u8 = (0 << 5);
+    pub const NRDY_INVERT_DISABLED: u8 = (1 << 5);
+}
+
+impl From<u8> for MeterControlValue {
+    fn from(num: u8) -> Self {
+        Self(num)
+    }
+}
+
+impl From<MeterControlValue> for u8 {
+    fn from(mc: MeterControlValue) -> Self {
+        mc.0
+    }
+}
+
+impl Default for MeterControlValue {
+    fn default() -> Self {
+        Self(Self::PCOMP_DISABLED | Self::NRDY_INVERT_DISABLED)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Format)]
 enum CalibrationStatus {
-    FactoryCalibrationRestored = 2,
-    AbcCalibration = 3,
-    TargetCalibration = 4,
-    BackgroundCalibration = 5,
-    ZeroCalibration = 6,
+    FactoryCalibrationRestored = (1 << 2),
+    AbcCalibration = (1 << 3),
+    TargetCalibration = (1 << 4),
+    BackgroundCalibration = (1 << 5),
+    ZeroCalibration = (1 << 6),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Format)]
@@ -145,6 +186,9 @@ pub enum Registers {
     BarometricAirPressureValueMsb = 0xDC,
     BarometricAirPressureValueLsb = 0xDD,
 
+    AbcBarometricAirPressureValueMsb = 0xDE,
+    AbcBarometricAirPressureValueLsb = 0xDF,
+
     Reserved01 = 0x02,
     Reserved02 = 0x03,
     Reserved03 = 0x04,
@@ -164,8 +208,6 @@ pub enum Registers {
     Reserved17 = 0xA6,
     Reserved10Mirror = 0xC0, // 0x80
     Reserved11Mirror = 0xC2, // 0x92
-    Reserved18 = 0xDE,
-    Reserved19 = 0xDF,
 }
 
 impl Registers {

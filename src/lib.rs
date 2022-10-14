@@ -1,20 +1,17 @@
 #![no_std]
-mod constants;
 
 use core::time::Duration;
-
-pub use constants::{CalibrationCommand, MeterControlValue};
-
-use constants::{
-    ErrorStatusMask::{self, *},
-    MeasurementMode,
-    Registers::{self, *},
-};
 use defmt::Format;
 
 use embedded_hal::{
     blocking::i2c::{Read, Write, WriteRead},
     digital::v2::{InputPin, OutputPin},
+};
+
+mod constants;
+use constants::Registers::{self, *};
+pub use constants::{
+    CalibrationCommand, CalibrationStatusValue, ErrorStatus, MeasurementMode, MeterControlValue,
 };
 
 static DEFAULT_I2C_ADRESS: u8 = 0x68;
@@ -26,6 +23,7 @@ pub enum SunriseError {
     GpioError,
     IllegalRegister,
     ArgumentError,
+    OutOfRange,
     ReadyReadFail,
     NotSupported,
     NeedReset,
@@ -46,49 +44,15 @@ enum State {
 
 pub type SrRes<T> = Result<T, SunriseError>;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct ErrorStatus(pub u16);
-
 #[derive(Clone, Copy, PartialEq, Debug, Format)]
 pub struct MeasurementResult {
-    co2_filtered_pc: u16,
-    co2_filtered: u16,
-    co2_unfiltered_pc: u16,
-    co2_unfiltered: u16,
-    temp_raw: u16,
-    measurement_count: u8,
-    error_status: ErrorStatus,
-}
-
-impl defmt::Format for ErrorStatus {
-    fn format(&self, fmt: defmt::Formatter) {
-        let masks = [
-            AlgorithmError,
-            CalibrationError,
-            Fatal,
-            I2cError,
-            LowInternalVoltage,
-            MeasurementNotCompleted,
-            MeasurementTimeout,
-            MemoryError,
-            OutOfRange,
-            SelfDiagnosticsError,
-        ];
-
-        defmt::write!(fmt, "ErrorStatus:[");
-        for mask in masks {
-            if self.has_error(mask) {
-                defmt::write!(fmt, "{},", mask);
-            }
-        }
-        defmt::write!(fmt, "]");
-    }
-}
-
-impl ErrorStatus {
-    pub fn has_error(&self, msk: ErrorStatusMask) -> bool {
-        (self.0 & (msk as u16)) > 0
-    }
+    pub co2_filtered_pc: u16,
+    pub co2_filtered: u16,
+    pub co2_unfiltered_pc: u16,
+    pub co2_unfiltered: u16,
+    pub temp_raw: u16,
+    pub measurement_count: u8,
+    pub error_status: ErrorStatus,
 }
 
 pub struct SunriseI2C<EN, RDY, I2C> {
@@ -101,7 +65,6 @@ pub struct SunriseI2C<EN, RDY, I2C> {
     state_data: [u8; 28],
     last_abc: Duration,
     meter_control: MeterControlValue,
-    abc_pressure: u16,
 }
 
 impl<EN, RDY, I2C, E> SunriseI2C<EN, RDY, I2C>
@@ -111,7 +74,7 @@ where
     I2C: WriteRead<Error = E> + Write<Error = E> + Read<Error = E>,
     E: core::fmt::Debug,
 {
-    pub fn new(i2c: I2C, en_pin: EN, rdy_pin: RDY, uptime: fn() -> Duration) -> Self {
+    pub fn new(i2c: I2C, en_pin: EN, rdy_pin: RDY, uptime: fn() -> Duration) -> SrRes<Self> {
         let mut co2_sensor = Self {
             en_pin: Some(en_pin),
             rdy_pin,
@@ -122,35 +85,31 @@ where
             state: State::Initial,
             last_abc: uptime(),
             meter_control: Default::default(),
-            abc_pressure: 0,
         };
+        defmt::error!("co2_sensor.meter_control {}", co2_sensor.meter_control);
 
-        co2_sensor.meter_control = co2_sensor.get_meter_control().unwrap_or_default();
+        let _ = co2_sensor.enable();
+        co2_sensor.meter_control = co2_sensor.get_meter_control()?;
 
-        co2_sensor
+        defmt::error!("co2_sensor.meter_control {}", co2_sensor.meter_control);
+
+        Ok(co2_sensor)
     }
 
-    pub fn set_single_measurement_mode(&mut self) -> SrRes<()> {
-        self.set_measurement_mode(MeasurementMode::Single)
-    }
-
-    /// Default period is 16 secs
-    pub fn set_continuous_measurement_mode(&mut self, period_s: u16) -> SrRes<()> {
-        if period_s == 0 {
-            self.write_reg16(MeasurementPeriodMsb, 16)?;
-        } else {
-            self.write_reg16(MeasurementPeriodMsb, period_s)?;
-        }
-
-        self.set_measurement_mode(MeasurementMode::Continuous)
-    }
-
-    fn set_measurement_mode(&mut self, mode: MeasurementMode) -> SrRes<()> {
+    pub fn set_measurement_mode(&mut self, mode: MeasurementMode) -> SrRes<()> {
         match mode {
-            MeasurementMode::Continuous => self.write_reg8(MeasurementMode, 0),
+            MeasurementMode::Continuous(period_s) => {
+                self.set_continuous_measurement_period(period_s)?;
+                self.write_reg8(MeasurementMode, 0)
+            }
             MeasurementMode::Single => self.write_reg8(MeasurementMode, 1),
         }?;
         self.soft_reset().or(Err(SunriseError::NeedReset))
+    }
+
+    /// Default period is 16 secs
+    pub fn set_continuous_measurement_period(&mut self, period_s: u16) -> SrRes<()> {
+        self.write_reg16(MeasurementPeriodMsb, period_s)
     }
 
     pub fn get_meter_control(&mut self) -> SrRes<MeterControlValue> {
@@ -160,7 +119,11 @@ where
 
     pub fn set_meter_control(&mut self, control_value: MeterControlValue) -> SrRes<()> {
         self.meter_control = control_value;
-        self.write_reg8(MeterControl, control_value.into())
+        if self.read_reg8(MeterControl)? != control_value.into() {
+            self.write_reg8(MeterControl, control_value.into())
+        } else {
+            Ok(())
+        }
     }
 
     pub fn do_single_measurement(&mut self) -> SrRes<()> {
@@ -180,7 +143,10 @@ where
             //     self.set_abc_barometric_air_pressure(self.abc_pressure)?;
             // }
 
-            defmt::debug!("Restore state_w: {}", single_with_state);
+            defmt::debug!(
+                "do_single_measurement(): restore state: {}",
+                self.state_data
+            );
             self.write_raw(&single_with_state)?;
         } else {
             self.write_reg8(StartSingleMeasurement, 1)?;
@@ -195,17 +161,9 @@ where
         let result = self.read_reg(AbcTimeMsbMirror, &mut state_data[..]); // the filter params trail the AbcTimeMsbMirror register 0xc4
         self.state_data = state_data;
 
-        // if self.is_pcomp_enabled() {
-        //     self.abc_pressure = self.get_abc_barometric_air_pressure()?;
-        // }
-
-        defmt::debug!("save state({:?}) -> {}", result, self.state_data);
+        defmt::debug!("save_state_on_host({:?}) -> {}", result, self.state_data);
 
         result
-    }
-
-    fn is_pcomp_enabled(&self) -> bool {
-        (u8::from(self.meter_control) & MeterControlValue::PCOMP_DISABLED) == 0
     }
 
     fn abc_age_hours(&self) -> u16 {
@@ -217,8 +175,8 @@ where
     }
 
     pub fn get_error_status(&mut self) -> SrRes<ErrorStatus> {
-        let raw = self.read_reg16(ErrorstatusMsb)?;
-        Ok(ErrorStatus(raw))
+        let value = self.read_reg16(ErrorstatusMsb)?;
+        Ok(value.into())
     }
 
     pub fn clear_error_status(&mut self) -> SrRes<()> {
@@ -259,7 +217,7 @@ where
         self.read_reg(ErrorstatusMsb, &mut data)?;
 
         Ok(MeasurementResult {
-            error_status: ErrorStatus((data[0x00] as u16) << 8 | data[0x01] as u16),
+            error_status: ErrorStatus::from_be_bytes([data[0], data[1]]),
             measurement_count: data[0x0d],
             temp_raw: (data[0x08] as u16) << 8 | data[0x09] as u16,
 
@@ -272,7 +230,11 @@ where
 
     /// Default is 8 samples
     pub fn set_number_of_samples(&mut self, samples: u16) -> SrRes<()> {
-        self.write_reg16(NumberOfSamplesMsb, samples)
+        if self.read_reg16(NumberOfSamplesMsb)? != samples {
+            self.write_reg16(NumberOfSamplesMsb, samples)
+        } else {
+            Ok(())
+        }
     }
     /// Valid range 2-10. Default of this setting is unclear...
     pub fn set_static_iir_filter_parameter(&mut self, param: u8) -> SrRes<()> {
@@ -283,33 +245,56 @@ where
         }
     }
 
-    pub fn set_barometric_air_pressure(&mut self, hPa: u16) -> SrRes<()> {
-        self.write_reg16(BarometricAirPressureValueMsb, hPa)
+    /// Set barometric air pressure given in hPa (scaled * 10 by this function)
+    pub fn set_barometric_air_pressure(&mut self, hpa: u16) -> SrRes<()> {
+        if (300..=1300).contains(&hpa) {
+            self.write_reg16(BarometricAirPressureValueMsb, hpa * 10)
+        } else {
+            Err(SunriseError::OutOfRange)
+        }
     }
 
-    pub fn set_abc_barometric_air_pressure(&mut self, hPa: u16) -> SrRes<()> {
-        self.write_reg16(AbcBarometricAirPressureValueMsb, hPa)
+    /// Set ABC barometric air pressure given in hPa (scaled * 10 by this function)
+    pub fn set_abc_barometric_air_pressure(&mut self, hpa: u16) -> SrRes<()> {
+        if (300..=1300).contains(&hpa) {
+            self.write_reg16(AbcBarometricAirPressureValueMsb, hpa * 10)
+        } else {
+            Err(SunriseError::OutOfRange)
+        }
     }
 
+    /// Get ABC barometric air pressure setting in hPa (scaled / 10 by this function)
     pub fn get_abc_barometric_air_pressure(&mut self) -> SrRes<u16> {
         self.read_reg16(AbcBarometricAirPressureValueMsb)
+            .map(|p| p / 10)
+    }
+
+    pub fn do_calibration_cycle(
+        &mut self,
+        cmd: CalibrationCommand,
+    ) -> SrRes<CalibrationStatusValue> {
+        self.clear_calibration_status()?;
+
+        self.send_calibration_command(cmd)?;
+        self.do_single_measurement()?;
+
+        self.get_calibration_status()
     }
 
     /// Send calibration command, will be 'executed' on next measurement, after which
     /// calibration status can be checked (`get_calibration_status()`)
     pub fn send_calibration_command(&mut self, cmd: CalibrationCommand) -> SrRes<()> {
-        self.clear_calibration_status()?;
         self.write_reg16(CalibrationCommandMsb, cmd as u16)
     }
 
-    pub fn get_calibration_status(&mut self) -> SrRes<u8> {
+    pub fn get_calibration_status(&mut self) -> SrRes<CalibrationStatusValue> {
         let value = self.read_reg8(CalibrationStatus)?;
 
         if value > 0 {
             self.last_abc = self.now()
         }
 
-        Ok(value)
+        Ok(value.into())
     }
 
     pub fn clear_calibration_status(&mut self) -> SrRes<()> {
@@ -350,7 +335,7 @@ where
         if self.en_pin.is_some() {
             defmt::trace!("Disable sensor (state: {:?})", self.state);
 
-            if self.state != State::Initial {
+            if self.state == State::Valid {
                 self.state = State::NeedsHostData;
                 self.save_state_on_host()?; // How to handle(?): not being able to save status to host, prevents sensor from sleeping..
             }
@@ -367,7 +352,7 @@ where
         if let Some(en) = self.en_pin.as_mut() {
             defmt::trace!("Enable sensor");
             let _ = en.set_high();
-            self.delay_ms(350);
+            self.delay_ms(100);
             Ok(())
         } else {
             Err(SunriseError::NotSupported)
@@ -379,7 +364,7 @@ where
             self.delay_ms(10);
             self.enable()
         } else {
-            if self.state != State::Initial {
+            if self.state == State::Valid {
                 self.state = State::NeedsHostData;
                 self.save_state_on_host()?;
             }
@@ -427,10 +412,10 @@ where
         defmt::trace!("read_reg {}({:#04x}) -> {:#04x}", reg, reg as u8, buffer);
 
         // Delay not needed in newer sensor types (need some further testing)
-        // self.delay_ms(1); // Fixes (workaround?) wierd I2C io errors that pop up occasionally
-        //                   // Adding the delay in wake() (on err/nack) is not helping
-        //                   // Problem arises when demo is switched from continuous mode to single mode
-        //                   // when trace logging (line above) is disabled.. (cause is not clear for now)
+        self.delay_ms(1); // Fixes (workaround?) wierd I2C io errors that pop up occasionally
+                          //                   // Adding the delay in wake() (on err/nack) is not helping
+                          //                   // Problem arises when demo is switched from continuous mode to single mode
+                          //                   // when trace logging (line above) is disabled.. (cause is not clear for now)
 
         Ok(())
     }
@@ -482,7 +467,7 @@ where
         // let _ = self.i2c.write(self.dev_addr, &mut dummy);
         if let Err(_) = self.i2c.read(self.dev_addr, &mut dummy) {
             // This does not seem to fix the ocasional read error
-            // self.delay_ms(1);
+            self.delay_ms(1);
         }
     }
 

@@ -86,12 +86,9 @@ where
             last_abc: uptime(),
             meter_control: Default::default(),
         };
-        defmt::error!("co2_sensor.meter_control {}", co2_sensor.meter_control);
 
-        let _ = co2_sensor.enable();
+        co2_sensor.enable()?;
         co2_sensor.meter_control = co2_sensor.get_meter_control()?;
-
-        defmt::error!("co2_sensor.meter_control {}", co2_sensor.meter_control);
 
         Ok(co2_sensor)
     }
@@ -153,7 +150,10 @@ where
         }
 
         self.state = State::Valid;
-        self.wait_rdy()
+
+        // Now waits for 3s max (2.4s needed for default settings as per datasheet)
+        // TODO: implement actual needed timeout value dependant on settings (e.g. number of samnples)
+        self.wait_rdy(3000)
     }
 
     pub fn save_state_on_host(&mut self) -> SrRes<()> {
@@ -486,11 +486,20 @@ where
         }
     }
 
-    fn wait_rdy(&self) -> SrRes<()> {
+    fn wait_rdy(&self, mut timeout_ms: i32) -> SrRes<()> {
         defmt::trace!("wait_rdy");
-        // self.delay_ms(self.no_samples * 300);
-        while !self.is_ready()? {}
-        Ok(())
+        while !self.is_ready()? && timeout_ms > 0 {
+            self.delay_ms(1);
+            timeout_ms -= 1;
+        }
+
+        if timeout_ms <= 0 {
+            defmt::warn!("wait_rdy, timed out!");
+            Err(SunriseError::TimedOut)
+        } else {
+            defmt::trace!("wait_rdy, time left {}ms", timeout_ms);
+            Ok(())
+        }
     }
 
     pub fn is_ready(&self) -> SrRes<bool> {

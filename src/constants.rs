@@ -27,6 +27,12 @@ pub enum CalibrationCommand {
 #[derive(Clone, Copy, PartialEq, Format)]
 pub struct MeterControlValue(u8);
 
+impl Default for MeterControlValue {
+    fn default() -> Self {
+        Self(Self::PCOMP_DISABLED | Self::NRDY_INVERT_DISABLED)
+    }
+}
+
 impl MeterControlValue {
     pub const NRDY_ENABLED: u8 = (0 << 0);
     pub const NRDY_DISABLED: u8 = (1 << 0);
@@ -112,12 +118,6 @@ impl From<MeterControlValue> for u8 {
     }
 }
 
-impl Default for MeterControlValue {
-    fn default() -> Self {
-        Self(Self::PCOMP_DISABLED | Self::NRDY_INVERT_DISABLED)
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Format)]
 pub struct CalibrationStatusValue(u8);
 
@@ -127,6 +127,10 @@ impl CalibrationStatusValue {
     pub const TARGET_CALIBRATION: u8 = (1 << 4);
     pub const BACKGROUND_CALIBRATION: u8 = (1 << 5);
     pub const ZERO_CALIBRATION: u8 = (1 << 6);
+
+    pub fn is_any_calibration(&self) -> bool {
+        self.0 != 0
+    }
 
     pub fn is_factory_calibration_restored(&self) -> bool {
         self.0 & Self::FACTORY_CALIBRATION_RESTORED != 0
@@ -328,10 +332,21 @@ pub enum Registers {
     Co2FpMsb = 0x06,
     Co2FpLsb = 0x07,
 
+    /// Chip temperature. Signed 16 bit value, unit °C x100.
+    /// For example, 0x09 (LSB) register value = 2223 means 22.23°C.
     TemperatureMsb = 0x08,
     TemperatureLsb = 0x09,
 
+    /// Counter incremented after each measurement, range 0 – 255.
+    /// The counter wraps around after the maximum value is reached.
+    /// Counter value can for example be used by the host system to ensure that the sensor has
+    /// done a measurement since last time measurement concentration was read.
     MeasurementCount = 0x0D,
+
+    /// Measurement cycle time shows current time in present measurement cycle, incremented every 2 seconds.
+    /// For example, Measurement cycle time = 3 means 6 seconds has passed in current measurement cycle.
+    /// Value is set to 0 when sensor starts a new measurement.
+    /// This value can be used by the host system to synchronise reading
     MeasurementCycleTimeMsb = 0x0E,
     MeasurementCycleTimeLsb = 0x0F,
 
@@ -391,8 +406,9 @@ pub enum Registers {
     MeterControl = 0xA5, // EE
     MbI2cAddress = 0xA7, // EE
 
-    // Registers from address 0xC0 to 0xCD are mirrors of registers at addresses 0x80, 0x81, 0x92, 0x93, and 0x88 to 0x91.
-    CalibrationStatusMirror = 0xC1,      // 0x81
+    /// Registers from address 0xC0 to 0xCD are mirrors of registers at addresses
+    /// 0x80, 0x81, 0x92, 0x93, and 0x88 to 0x91.
+    CalibrationStatusMirror = 0xC1, // 0x81
     StartSingleMeasurementMirror = 0xC3, // 0x93
     AbcTimeMsbMirror = 0xC4,             // 0x88
     AbcTimeLsbMirror = 0xC5,             // 0x89
